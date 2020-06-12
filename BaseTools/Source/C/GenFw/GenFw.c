@@ -98,6 +98,16 @@ ZeroDebugData (
 
 STATIC
 EFI_STATUS
+PatchResourceData (
+  IN     UINT16  Type,
+  IN     UINT8   *ResourceData,
+  IN     UINT32  ResourceDataSize,
+  IN OUT UINT8   **PeCoff,
+  IN OUT UINT32  *PeCoffSize
+  );
+
+STATIC
+EFI_STATUS
 SetStamp (
   IN OUT UINT8  *FileBuffer,
   IN     CHAR8  *TimeStamp
@@ -267,6 +277,11 @@ Returns:
                         except for -o option. It is a action option.\n\
                         If it is combined with other action options, the later\n\
                         input action option will override the previous one.\n");
+  fprintf (stdout, "  --rc FlieName         Append a Hii resource section to the\n\
+                        last PE/COFF section. The FileName is the resource section to append\n\
+                        If FileName does not exist this operation is skipped. This feature is\n\
+                        only intended for toolchains, like XCODE, that don't suport $(RC).\n\
+                        This option can only be combined with -e\n");
   fprintf (stdout, "  --rebase NewAddress   Rebase image to new base address. New address \n\
                         is also set to the first none code section header.\n\
                         It can't be combined with other action options\n\
@@ -1059,10 +1074,12 @@ Returns:
   CHAR8                            **InputFileName;
   char                             *OutImageName;
   char                             *ModuleType;
+  char                             *RcFileName;
   CHAR8                            *TimeStamp;
   FILE                             *fpIn;
   FILE                             *fpOut;
   FILE                             *fpInOut;
+  FILE                             *fpRc;
   UINT32                           Data;
   UINT32                           *DataPointer;
   UINT32                           *OldDataPointer;
@@ -1080,6 +1097,8 @@ Returns:
   UINT32                           OutputFileLength;
   UINT8                            *InputFileBuffer;
   UINT32                           InputFileLength;
+  UINT8                            *RcFileBuffer;
+  UINT32                           RcFileLength;
   RUNTIME_FUNCTION                 *RuntimeFunction;
   UNWIND_INFO                      *UnwindInfo;
   STATUS                           Status;
@@ -1116,6 +1135,7 @@ Returns:
   time_t                           OutputFileTime;
   struct stat                      Stat_Buf;
   BOOLEAN                          ZeroDebugFlag;
+  BOOLEAN                          InsertRcFile;
 
   SetUtilityName (UTILITY_NAME);
 
@@ -1128,6 +1148,7 @@ Returns:
   mInImageName      = NULL;
   OutImageName      = NULL;
   ModuleType        = NULL;
+  RcFileName        = NULL;
   Type              = 0;
   Status            = STATUS_SUCCESS;
   FileBuffer        = NULL;
@@ -1164,6 +1185,7 @@ Returns:
   InputFileTime          = 0;
   OutputFileTime         = 0;
   ZeroDebugFlag          = FALSE;
+  InsertRcFile           = FALSE;
 
   if (argc == 1) {
     Error (NULL, 0, 1001, "Missing options", "No input options.");
@@ -1436,6 +1458,20 @@ Returns:
       continue;
     }
 
+    if (stricmp (argv[0], "--rc") == 0) {
+      RcFileName = argv[1];
+      argc -= 2;
+      argv += 2;
+
+      if (stat (RcFileName, &Stat_Buf) == 0) {
+        //
+        // File exists
+        //
+        InsertRcFile = TRUE;
+      }
+      continue;
+    }
+
     if (argv[0][0] == '-') {
       Error (NULL, 0, 1000, "Unknown option", argv[0]);
       goto Finish;
@@ -1566,6 +1602,10 @@ Returns:
     break;
   default:
     break;
+  }
+
+  if (InsertRcFile) {
+    VerboseMsg ("RC input file %s", RcFileName);
   }
 
   if (ReplaceFlag) {
@@ -2051,6 +2091,52 @@ Returns:
       }
     }
   }
+
+  //
+  // Insert Resources into the image.
+  //
+  if (InsertRcFile) {
+    fpRc = fopen (LongFilePath (RcFileName), "rb");
+    if (fpRc == NULL) {
+      Error (NULL, 0, 0001, "Error opening file", RcFileName);
+      goto Finish;
+    }
+
+    RcFileLength = _filelength (fileno (fpRc));
+    RcFileBuffer = malloc (RcFileLength);
+    if (FileBuffer == NULL) {
+      Error (NULL, 0, 4001, "Resource", "memory cannot be allocated!");
+      fclose (fpRc);
+      goto Finish;
+    }
+
+    fread (RcFileBuffer, 1, RcFileLength, fpRc);
+    fclose (fpRc);
+
+    Status = PatchResourceData (Type, RcFileBuffer, RcFileLength, &FileBuffer, &FileLength);
+    if (EFI_ERROR (Status)) {
+      Error (NULL, 0, 3000, "Invalid", "RC Patch Data Error status is 0x%x", (int) Status);
+      goto Finish;
+    }
+
+    fpOut = fopen (LongFilePath (OutImageName), "wb");
+    if (fpOut == NULL) {
+      Error (NULL, 0, 0001, "Error opening output file", OutImageName);
+      goto Finish;
+    }
+
+    fwrite (FileBuffer, 1, FileLength, fpOut);
+
+    fclose (fpOut);
+    fpOut = NULL;
+    VerboseMsg ("the size of output file is %u bytes", (unsigned) FileLength);
+
+    //
+    // Write the updated Image
+    //
+    goto Finish;
+  }
+
 
   //
   // Convert ELF image to PeImage
@@ -2760,6 +2846,290 @@ Finish:
 
   return GetUtilityStatus ();
 }
+
+#define ALIGN_VALUE(Value, Alignment) ((Value) + (((Alignment) - (Value)) & ((Alignment) - 1)))
+
+STATIC
+EFI_STATUS
+PatchResourceData (
+  IN     UINT16  Type,
+  IN     UINT8   *ResourceData,
+  IN     UINT32  ResourceDataSize,
+  IN OUT UINT8   **PeCoff,
+  IN OUT UINT32  *PeCoffSize
+  )
+/*++
+
+Routine Description:
+
+  Embed Resource data into a PE/COFF image.
+
+  If there is free space between the header and the image add a new
+  .rsrc section to the PE/COFF image. If no space exists then append
+  the resource data to the last section.
+
+Arguments:
+
+  Type             - If not zero them update PE/COFF header module type.
+  ResourceData     - *hii.rc data to insert into the image.
+  ResourceDataSize - Size of ResourceData in bytes.
+  PeCoff           - On input existing PE/COFF, on output input PE/COFF with
+                     ResourceData embedded.
+  PeCoffSize       - Size of PeCoff in bytes.
+
+Returns:
+
+  EFI_ABORTED   - PeImage is invalid.
+  EFI_SUCCESS   - Zero debug data successfully.
+
+--*/
+{
+  UINT8                                 *FileBuffer;
+  UINT32                                FileBufferSize;
+  EFI_IMAGE_DOS_HEADER                  *DosHdr;
+  EFI_IMAGE_FILE_HEADER                 *FileHdr;
+  EFI_IMAGE_OPTIONAL_HEADER32           *Optional32Hdr;
+  EFI_IMAGE_OPTIONAL_HEADER64           *Optional64Hdr;
+  EFI_IMAGE_SECTION_HEADER              *SectionHeader;
+  UINT32                                FileAlignment;
+  UINT32                                Max;
+  INTN                                  LastSection;
+  INTN                                  EmptySection;
+  UINT32                                ActualHeaderSize;
+  UINT32                                StartingPeCoffSize;
+  UINT32                                NewHeaderSize;
+  CHAR8                                 *Base;
+  EFI_IMAGE_RESOURCE_DIRECTORY          *ResourceDirectory;
+  EFI_IMAGE_RESOURCE_DIRECTORY_ENTRY    *ResourceDirectoryEntry;
+  EFI_IMAGE_RESOURCE_DIRECTORY_STRING   *ResourceDirectoryString;
+  EFI_IMAGE_RESOURCE_DATA_ENTRY         *ResourceDataEntry;
+  EFI_IMAGE_DATA_DIRECTORY              *DirectoryEntry;
+  CHAR16                                *String;
+  UINT32                                Offset;
+  UINT32                                Index;
+
+  //
+  // Grow the file in units of FileAlignment
+  //
+  DosHdr   = (EFI_IMAGE_DOS_HEADER *)  *PeCoff;
+  if (DosHdr->e_magic != EFI_IMAGE_DOS_SIGNATURE) {
+    // NO DOS header, must start with PE/COFF header
+    FileHdr  = (EFI_IMAGE_FILE_HEADER *)(*PeCoff + sizeof (UINT32));
+  } else {
+    FileHdr  = (EFI_IMAGE_FILE_HEADER *)(*PeCoff + DosHdr->e_lfanew + sizeof (UINT32));
+  }
+
+  Optional32Hdr = (EFI_IMAGE_OPTIONAL_HEADER32 *) ((UINT8*) FileHdr + sizeof (EFI_IMAGE_FILE_HEADER));
+  Optional64Hdr = (EFI_IMAGE_OPTIONAL_HEADER64 *) ((UINT8*) FileHdr + sizeof (EFI_IMAGE_FILE_HEADER));
+  if (Optional32Hdr->Magic == EFI_IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+    FileAlignment     = Optional32Hdr->FileAlignment;
+    SectionHeader     = (EFI_IMAGE_SECTION_HEADER *) ((UINT8 *) Optional32Hdr +  FileHdr->SizeOfOptionalHeader);
+  } else {
+    FileAlignment     = Optional64Hdr->FileAlignment;
+    SectionHeader     = (EFI_IMAGE_SECTION_HEADER *) ((UINT8 *) Optional64Hdr +  FileHdr->SizeOfOptionalHeader);
+  }
+
+  LastSection = -1;
+  for (Index = 0, Max = 0; Index < FileHdr->NumberOfSections; Index++) {
+    if (SectionHeader[Index].PointerToRawData > Max) {
+      Max = SectionHeader[Index].PointerToRawData;
+      LastSection = Index;
+    }
+  }
+
+  EmptySection = -1;
+  for (Index = 0; Index < FileHdr->NumberOfSections; Index++) {
+    if ((SectionHeader[Index].Misc.VirtualSize == 0) && (SectionHeader[Index].SizeOfRawData  == 0)) {
+      //
+      // No Data or Zero Fill so we can repurpose this entry.
+      //
+      EmptySection = Index;
+      break;
+    }
+  }
+
+  if (EmptySection == -1) {
+    ActualHeaderSize = (UINTN)(&SectionHeader[FileHdr->NumberOfSections]) - (UINTN)*PeCoff;
+    if ((ActualHeaderSize + sizeof (EFI_IMAGE_SECTION_HEADER)) <= Optional32Hdr->SizeOfHeaders) {
+      //
+      // There is space to inject a new section.
+      //
+      FileHdr->NumberOfSections += 1;
+      EmptySection = Index;
+    }
+  }
+
+  StartingPeCoffSize = SectionHeader[LastSection].PointerToRawData + SectionHeader[LastSection].SizeOfRawData;
+  if (SectionHeader[LastSection].Misc.VirtualSize > SectionHeader[LastSection].SizeOfRawData) {
+    StartingPeCoffSize += SectionHeader[LastSection].Misc.VirtualSize - SectionHeader[LastSection].SizeOfRawData;
+  }
+
+  FileBufferSize     = ALIGN_VALUE(StartingPeCoffSize + ResourceDataSize, FileAlignment);
+  FileBuffer = malloc (FileBufferSize);
+  if (FileBuffer == NULL) {
+    return RETURN_OUT_OF_RESOURCES;
+  }
+  memset (FileBuffer, 0, FileBufferSize);
+
+  //
+  // Append the Resource Data to the end of the PE/COFF image.
+  //
+  NewHeaderSize = Optional32Hdr->SizeOfHeaders;
+  CopyMem (FileBuffer, *PeCoff, (StartingPeCoffSize > *PeCoffSize) ?  *PeCoffSize: StartingPeCoffSize);
+  CopyMem (FileBuffer + StartingPeCoffSize, ResourceData, ResourceDataSize);
+
+  free (*PeCoff);
+  *PeCoff     = FileBuffer;
+  *PeCoffSize = FileBufferSize;
+
+  DosHdr = (EFI_IMAGE_DOS_HEADER *)FileBuffer;
+  if (DosHdr->e_magic != EFI_IMAGE_DOS_SIGNATURE) {
+    // NO DOS header, must start with PE/COFF header
+    FileHdr  = (EFI_IMAGE_FILE_HEADER *)(FileBuffer + sizeof (UINT32));
+  } else {
+    FileHdr  = (EFI_IMAGE_FILE_HEADER *)(FileBuffer + DosHdr->e_lfanew + sizeof (UINT32));
+  }
+
+  //
+  // Get Resource EntryTable offset, and Section header
+  //
+  Optional32Hdr = (EFI_IMAGE_OPTIONAL_HEADER32 *) ((UINT8*) FileHdr + sizeof (EFI_IMAGE_FILE_HEADER));
+  Optional64Hdr = (EFI_IMAGE_OPTIONAL_HEADER64 *) ((UINT8*) FileHdr + sizeof (EFI_IMAGE_FILE_HEADER));
+  DirectoryEntry = NULL;
+  if (Optional32Hdr->Magic == EFI_IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+    SectionHeader = (EFI_IMAGE_SECTION_HEADER *) ((UINT8 *) Optional32Hdr +  FileHdr->SizeOfOptionalHeader);
+    if (Optional32Hdr->NumberOfRvaAndSizes > EFI_IMAGE_DIRECTORY_ENTRY_RESOURCE) {
+      DirectoryEntry = &Optional32Hdr->DataDirectory[EFI_IMAGE_DIRECTORY_ENTRY_RESOURCE];
+    }
+  } else {
+    SectionHeader = (EFI_IMAGE_SECTION_HEADER *) ((UINT8 *) Optional64Hdr +  FileHdr->SizeOfOptionalHeader);
+    if (Optional64Hdr->NumberOfRvaAndSizes > EFI_IMAGE_DIRECTORY_ENTRY_RESOURCE) {
+      DirectoryEntry = &Optional64Hdr->DataDirectory[EFI_IMAGE_DIRECTORY_ENTRY_RESOURCE];
+    }
+  }
+
+  if (DirectoryEntry == NULL) {
+    return RETURN_OUT_OF_RESOURCES;
+  }
+
+  if (EmptySection != -1) {
+    //
+    // Create a new section
+    //
+    CopyMem (SectionHeader[EmptySection].Name, ".rsrc\0\0\0", EFI_IMAGE_SIZEOF_SHORT_NAME);
+    SectionHeader[EmptySection].Misc.VirtualSize = ResourceDataSize;
+    SectionHeader[EmptySection].VirtualAddress   = StartingPeCoffSize;
+    SectionHeader[EmptySection].SizeOfRawData    = ALIGN_VALUE(ResourceDataSize, FileAlignment);
+    SectionHeader[EmptySection].PointerToRawData = StartingPeCoffSize;
+
+    SectionHeader[EmptySection].Characteristics  = EFI_IMAGE_SCN_MEM_EXECUTE | EFI_IMAGE_SCN_MEM_READ;
+    SectionHeader[EmptySection].Characteristics |= EFI_IMAGE_SCN_CNT_INITIALIZED_DATA | EFI_IMAGE_SCN_CNT_CODE;
+
+    DirectoryEntry->VirtualAddress = SectionHeader[EmptySection].VirtualAddress;
+  } else {
+    //
+    // Grow the last section to include the resources.
+    // For Xcode this is always the .debug section.
+    //
+    SectionHeader[LastSection].SizeOfRawData = ALIGN_VALUE(SectionHeader[LastSection].SizeOfRawData + ResourceDataSize, FileAlignment);
+
+    //
+    // Make sure the Virtual Size uses the file aligned actual size, since we are growing the file.
+    //
+    SectionHeader[LastSection].Misc.VirtualSize = SectionHeader[LastSection].SizeOfRawData;
+
+    DirectoryEntry->VirtualAddress = StartingPeCoffSize;
+  }
+  DirectoryEntry->Size           = ResourceDataSize;
+
+  Optional32Hdr->SizeOfImage = ALIGN_VALUE(*PeCoffSize, Optional32Hdr->SectionAlignment);
+  if (Type != 0) {
+    Optional32Hdr->Subsystem = Type;
+  }
+
+  //
+  // It looks like the ResourceDataEntry->OffsetToData is relative to the rc file,
+  // but PeCoffLoaderLoadImage() assumes it is a PE/COFF VirtualAddress so we need
+  // to fix it up. Walk the ResourceDataEntry just like PeCoffLoaderLoadImage() and
+  // patch it.
+  //
+  Base                   = (CHAR8 *)(FileBuffer + StartingPeCoffSize);
+  ResourceDirectory      = (EFI_IMAGE_RESOURCE_DIRECTORY *)Base;
+  ResourceDirectoryEntry = (EFI_IMAGE_RESOURCE_DIRECTORY_ENTRY *)(ResourceDirectory + 1);
+
+  for (Index = 0; Index < ResourceDirectory->NumberOfNamedEntries; Index++) {
+    if (ResourceDirectoryEntry->u1.s.NameIsString) {
+      //
+      // Check the ResourceDirectoryEntry->u1.s.NameOffset before use it.
+      //
+      if (ResourceDirectoryEntry->u1.s.NameOffset >= DirectoryEntry->Size) {
+         return RETURN_UNSUPPORTED;
+      }
+      ResourceDirectoryString = (EFI_IMAGE_RESOURCE_DIRECTORY_STRING *) (Base + ResourceDirectoryEntry->u1.s.NameOffset);
+      String = &ResourceDirectoryString->String[0];
+
+      if (ResourceDirectoryString->Length == 3 &&
+          String[0] == L'H' &&
+          String[1] == L'I' &&
+          String[2] == L'I') {
+        //
+        // Resource Type "HII" found
+        //
+        if (ResourceDirectoryEntry->u2.s.DataIsDirectory) {
+          //
+          // Move to next level - resource Name
+          //
+          if (ResourceDirectoryEntry->u2.s.OffsetToDirectory >= DirectoryEntry->Size) {
+            return RETURN_UNSUPPORTED;
+          }
+          ResourceDirectory = (EFI_IMAGE_RESOURCE_DIRECTORY *) (Base + ResourceDirectoryEntry->u2.s.OffsetToDirectory);
+          Offset = ResourceDirectoryEntry->u2.s.OffsetToDirectory + sizeof (EFI_IMAGE_RESOURCE_DIRECTORY) +
+                   sizeof (EFI_IMAGE_RESOURCE_DIRECTORY_ENTRY) * (ResourceDirectory->NumberOfNamedEntries + ResourceDirectory->NumberOfIdEntries);
+          if (Offset > DirectoryEntry->Size) {
+            return RETURN_UNSUPPORTED;
+          }
+          ResourceDirectoryEntry = (EFI_IMAGE_RESOURCE_DIRECTORY_ENTRY *) (ResourceDirectory + 1);
+
+          if (ResourceDirectoryEntry->u2.s.DataIsDirectory) {
+            //
+            // Move to next level - resource Language
+            //
+            if (ResourceDirectoryEntry->u2.s.OffsetToDirectory >= DirectoryEntry->Size) {
+              return RETURN_UNSUPPORTED;
+            }
+            ResourceDirectory = (EFI_IMAGE_RESOURCE_DIRECTORY *) (Base + ResourceDirectoryEntry->u2.s.OffsetToDirectory);
+            Offset = ResourceDirectoryEntry->u2.s.OffsetToDirectory + sizeof (EFI_IMAGE_RESOURCE_DIRECTORY) +
+                     sizeof (EFI_IMAGE_RESOURCE_DIRECTORY_ENTRY) * (ResourceDirectory->NumberOfNamedEntries + ResourceDirectory->NumberOfIdEntries);
+            if (Offset > DirectoryEntry->Size) {
+              return RETURN_UNSUPPORTED;
+            }
+            ResourceDirectoryEntry = (EFI_IMAGE_RESOURCE_DIRECTORY_ENTRY *) (ResourceDirectory + 1);
+          }
+        }
+
+        //
+        // Now it ought to be resource Data
+        //
+        if (!ResourceDirectoryEntry->u2.s.DataIsDirectory) {
+          if (ResourceDirectoryEntry->u2.OffsetToData >= DirectoryEntry->Size) {
+            return RETURN_UNSUPPORTED;
+          }
+          ResourceDataEntry = (EFI_IMAGE_RESOURCE_DATA_ENTRY *) (Base + ResourceDirectoryEntry->u2.OffsetToData);
+
+          //
+          // Adjust OffsetToData to be a PE/COFF Virtual address in the updated image.
+          //
+          ResourceDataEntry->OffsetToData  += (UINTN)DirectoryEntry->VirtualAddress;
+          break;
+        }
+      }
+    }
+    ResourceDirectoryEntry++;
+  }
+
+  return EFI_SUCCESS;
+}
+
 
 STATIC
 EFI_STATUS
